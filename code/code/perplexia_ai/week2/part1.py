@@ -10,6 +10,7 @@ This implementation focuses on:
 
 import os
 from typing import Dict, List, Optional, TypedDict
+from unittest import result
 from perplexia_ai.core.chat_interface import ChatInterface
 from langchain.chat_models import init_chat_model
 from langchain_tavily import TavilySearch
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field
 from langchain.prompts import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate
+    HumanMessagePromptTemplate,
 )
 
 
@@ -56,9 +57,9 @@ class WebSearchChat(ChatInterface):
         if openai_api_base:
             model_kwargs["base_url"] = openai_api_base
 
-        self.llm = init_chat_model(
-            **model_kwargs, reasoning_effects="minimal"
-        ).with_structured_output(SearchResponse)
+        self.llm = init_chat_model(**model_kwargs).with_structured_output(
+            SearchResponse
+        )
         self.search_tool = tool = TavilySearch(
             max_results=5,
             include_answer=False,  # True provides an answer from Tavily's side. Use False in assignments.
@@ -100,11 +101,23 @@ class WebSearchChat(ChatInterface):
         Returns:
             str: The assistant's response based on web search results
         """
-        return "Not implemented yet. Please implement Week 2 Part 1: Web Search with LangGraph."
+        result = self.graph.invoke({"query": message})
+        response = result["response"].dict()
+        return {
+            "text": f'{response["answer"]}\nSources: {", ".join(response["citations"])}'
+        }
 
     def __search(self, state: SearchState):
         """Perform web search using the query in the state."""
-        state["search_results"] = self.search_tool.invoke({"query": state["query"]})
+        search_response = self.search_tool.invoke({"query": state["query"]})
+        
+        # Extract the actual results from the Tavily response
+        if isinstance(search_response, dict) and "results" in search_response:
+            state["search_results"] = search_response["results"]
+        else:
+            state["search_results"] = search_response
+            
+        print("Actual Search Results:", state["search_results"])
         return state
 
     def __summarize_llm(self, state: SearchState):
@@ -113,50 +126,48 @@ class WebSearchChat(ChatInterface):
         summarizing_prompt = ChatPromptTemplate.from_messages(
             [
                 SystemMessagePromptTemplate.from_template(
-                    """You are an AI assistant that provides concise answers based on web search results.
-                Given the following search results, generate a clear and concise answer to the user's query.
-                You don’t need to cite a document for each sentence. The format should be an 'answer' and a list of 'sources' at the end.
-                The summarized search results should appear in the 'answer', while all citations should be listed in 'sources'.
+                    """You are an AI assistant that analyzes web search results and provides comprehensive answers.
 
-                Examples:
+CRITICAL INSTRUCTIONS:
+- You MUST use the search results provided below to answer the user's question
+- Extract specific facts, developments, and information from the search results
+- If search results contain relevant information, you MUST include it in your answer
+- Only say "no information available" if the search results are truly empty or completely irrelevant
+- Always cite the sources using the URLs from the search results
 
-                Search Results:
-                1. "SpaceX successfully launched Starship today at 10:00 AM..."
-                2. "The launch marks a milestone in commercial space travel..."
-
-                User Query: When did SpaceX launch Starship today?
-
-                Answer: SpaceX successfully launched Starship today at 10:00 AM, marking a significant milestone in commercial space travel.
-                Sources: ["https://example.com/article1", "https://example.com/article2"]
-
-                Search Results:
-                1. "The new climate policy focuses on reducing carbon emissions..."
-                2. "It introduces incentives for renewable energy adoption..."
-
-                User Query: What are the key points of the new climate policy?
-
-                Answer: The new climate policy aims to reduce carbon emissions and provides incentives for adopting renewable energy.
-                Sources: ["https://example.com/climate1", "https://example.com/climate2"]
-                """
+Your response must be in JSON format with 'answer' and 'citations' fields."""
                 ),
                 HumanMessagePromptTemplate.from_template(
-                    """Now, based on the search results below, generate the answer in the same format:
+                    """Here are the search results for the query:
 
-                Search Results:
-                {search_results}
+{search_results}
 
-                User Query:
-                {user_query}
+User Query: {user_query}
 
-                Answer:"""
+Please analyze these search results and provide a comprehensive answer about {user_query}. Include specific details and developments mentioned in the search results."""
                 ),
             ]
         )
 
-        formatted_prompt = summarizing_prompt.format(
-            search_results="\n".join(state.search_results),
-            user_query=state.query
+        formatted_results = "\n\n".join(
+            (
+                f"Result {i+1}:\nTitle: {item.get('title', 'No title')}\nContent: {item.get('content', str(item))}\nURL: {item.get('url', 'No URL')}"
+                if isinstance(item, dict)
+                else f"Result {i+1}: {str(item)}"
+            )
+            for i, item in enumerate(state["search_results"])
         )
+
+        formatted_prompt = summarizing_prompt.format(
+            search_results=formatted_results,
+            user_query=state["query"],
+        )
+        
+        # Debug: Print what's being sent to LLM
+        print("=== FORMATTED PROMPT FOR LLM ===")
+        print(formatted_prompt)
+        print("=== END PROMPT ===")
+        
         response = self.llm.invoke(formatted_prompt)
-        state.response = response
+        state["response"] = response
         return state
